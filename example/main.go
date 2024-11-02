@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"time"
 
 	"github.com/savely-krasovsky/raiffeisen-retail-api"
 )
@@ -13,11 +14,16 @@ import (
 var (
 	username string
 	password string
+	from     string
+	to       string
 )
 
 func main() {
+	now := time.Now()
 	flag.StringVar(&username, "username", "", "Username")
 	flag.StringVar(&password, "password", "", "Password")
+	flag.StringVar(&from, "from", "", "From date")
+	flag.StringVar(&to, "to", now.Format("02.01.2006"), "To date")
 	flag.Parse()
 
 	c, err := raiffeisen.NewClient()
@@ -54,8 +60,8 @@ func main() {
 	for _, account := range accountBalances {
 		turnover, err := c.TransactionalAccountTurnover(account.ProductCoreID, account.Number, &raiffeisen.TransactionalAccountTurnoverFilter{
 			CurrencyCodeNumeric: account.CurrencyCodeNumeric,
-			FromDate:            "01.01.2024",
-			ToDate:              "01.11.2024",
+			FromDate:            from,
+			ToDate:              to,
 		})
 		if err != nil {
 			panic(err)
