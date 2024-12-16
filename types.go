@@ -80,12 +80,20 @@ type Transaction struct {
 type TransactionType string
 
 const (
-	POSTransactionType        TransactionType = "POS"
-	ExchBuyTransactionType    TransactionType = "ExchBuy"
-	ExchSellTransactionType   TransactionType = "ExchSell"
-	IncomeTransactionType     TransactionType = "Income"
+
+	// POSTransactionType represents a point-of-sale credit or debit transaction type.
+	POSTransactionType TransactionType = "POS"
+	// OtherTransactionType represents a transaction type that does not fall into predefined categories,
+	// could be both credit or debit.
+	OtherTransactionType TransactionType = "Other"
+	// ExchBuyTransactionType represents a credit transaction type for exchange buy operations.
+	ExchBuyTransactionType TransactionType = "ExchBuy"
+	// ExchSellTransactionType represents a debit transaction type for exchange sell operations.
+	ExchSellTransactionType TransactionType = "ExchSell"
+	// IncomeTransactionType represents a debit type of transaction associated with receiving income.
+	IncomeTransactionType TransactionType = "Income"
+	// IncomeCashTransactionType represents a debit transaction type indicating income received in cash.
 	IncomeCashTransactionType TransactionType = "IncomeCash"
-	OtherTransactionType      TransactionType = "Other"
 )
 
 func (t *Transaction) ToActualBudgetTransaction() *ActualBudgetTransaction {

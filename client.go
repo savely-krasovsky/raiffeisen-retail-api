@@ -336,32 +336,22 @@ func (c *client) TransactionalAccountTurnover(productCoreID string, accountNumbe
 			Type:                TransactionType(transaction.([]any)[13].(string)),
 		}
 
-		credit := true
-		index := 8
-		switch transactions[i].Type {
-		case POSTransactionType:
-		case OtherTransactionType:
-		case ExchBuyTransactionType:
-		case ExchSellTransactionType:
-			credit = false
-			index = 9
-		case IncomeTransactionType:
-			credit = false
-			index = 9
-		case IncomeCashTransactionType:
-			credit = false
-			index = 9
-		}
-
-		amount, err := decimal.NewFromString(transaction.([]any)[index].(string))
+		creditAmount, err := decimal.NewFromString(transaction.([]any)[8].(string))
 		if err != nil {
-			c.logger.Error("Cannot parse amount for transaction", "err", err)
+			c.logger.Error("Cannot parse credit amount for transaction", "err", err)
 			continue
 		}
-		if credit {
-			transactions[i].Amount = amount.Neg()
-		} else {
-			transactions[i].Amount = amount
+		debigAmount, err := decimal.NewFromString(transaction.([]any)[9].(string))
+		if err != nil {
+			c.logger.Error("Cannot parse debit amount for transaction", "err", err)
+			continue
+		}
+
+		if !creditAmount.IsZero() {
+			transactions[i].Amount = creditAmount.Neg()
+		}
+		if !debigAmount.IsZero() {
+			transactions[i].Amount = debigAmount
 		}
 
 		d, err := time.Parse("02.01.2006 15:04:05", transaction.([]any)[3].(string))
