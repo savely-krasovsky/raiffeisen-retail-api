@@ -13,11 +13,11 @@ import transactions from './transactions.json' assert {type: 'json'}
 
   await api.downloadBudget('SYNC-ID-FROM-ADVANCED-SETTINGS');
 
-  const accounts = await api.getAccounts();
-
   transactions.forEach((transaction, i) => {
     transactions[i]['date'] = new Date(Date.parse(transaction['date']))
   })
+
+  const accounts = await api.getAccounts();
 
   await api.importTransactions(accounts[0].id, transactions)
 

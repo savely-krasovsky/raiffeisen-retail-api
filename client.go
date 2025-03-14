@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -71,7 +72,7 @@ func (c *client) Login() error {
 }
 
 func (c *client) LoginFont(username string, password string) error {
-	usernameBytes := []byte(username)
+	usernameBytes := []byte(strings.ToLower(username))
 	if len(usernameBytes) < 8 {
 		usernameBytes = bytes.Join([][]byte{usernameBytes, bytes.Repeat([]byte{0}, 8-len(usernameBytes))}, nil)
 	}
