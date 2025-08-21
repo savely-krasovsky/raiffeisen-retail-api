@@ -1,7 +1,8 @@
 # Golang Raiffeisen Retail API client
 
 Allows to export transactions from all accounts for Serbian branch of Raiffeisen Bank.
-It could probably work for another branches, but not tests. Feel free to contibute.
+It could probably work for another branches, but I tested it only with Serbian retail account.
+Feel free to contibute.
 
 ## How to use
 
