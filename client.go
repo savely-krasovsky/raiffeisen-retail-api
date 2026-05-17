@@ -1,7 +1,9 @@
 package raiffeisen
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -9,7 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -22,11 +26,19 @@ import (
 
 const (
 	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0"
+	origin    = "https://rol.raiffeisenbank.rs"
+	referer   = "https://rol.raiffeisenbank.rs/Retail/Home/Login"
+
+	signalRBaseURL  = "https://rol.raiffeisenbank.rs/Retail/signalr"
+	signalRProtocol = "2.1"
+	ibankingHubData = `[{"name":"ibankinghub"}]`
 )
 
 type Client interface {
 	Login() error
-	LoginFont(username, password string) error
+	LoginFont(username, password string) (*LoginFontResponse, error)
+	RequestLoginPush(ctx context.Context, ticket, username string) (*LoginPushResult, error)
+	LoginUPPush(firstStepTicket, pushRequestContent string, sessionID int) error
 	DashboardPreview() ([]*DashboardPreviewAccount, error)
 	AllAccountBalance() ([]*AccountBalance, error)
 	TransactionalAccountTurnover(productCoreID string, accountNumber string, filter *TransactionalAccountTurnoverFilter) (*TransactionalAccountTurnover, error)
@@ -71,7 +83,7 @@ func (c *client) Login() error {
 	return nil
 }
 
-func (c *client) LoginFont(username string, password string) error {
+func (c *client) LoginFont(username string, password string) (*LoginFontResponse, error) {
 	usernameBytes := []byte(strings.ToLower(username))
 	if len(usernameBytes) < 8 {
 		usernameBytes = bytes.Join([][]byte{usernameBytes, bytes.Repeat([]byte{0}, 8-len(usernameBytes))}, nil)
@@ -111,12 +123,311 @@ func (c *client) LoginFont(username string, password string) error {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		c.logger.Error("Error while trying to login!", "err", err)
+		return nil, err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected LoginFont status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var response LoginFontResponse
+	if err := json.NewDecoder(bomRemover(resp.Body)).Decode(&response); err != nil {
+		c.logger.Error("Cannot decode LoginFont response", "err", err)
+		return nil, err
+	}
+	return &response, nil
+}
+
+type signalRNegotiate struct {
+	ConnectionToken string `json:"ConnectionToken"`
+	ConnectionId    string `json:"ConnectionId"`
+	ProtocolVersion string `json:"ProtocolVersion"`
+}
+
+type signalREnvelope struct {
+	C string             `json:"C,omitempty"`
+	S int                `json:"S,omitempty"`
+	M []signalRServerInv `json:"M,omitempty"`
+	I string             `json:"I,omitempty"`
+	R json.RawMessage    `json:"R,omitempty"`
+	E string             `json:"E,omitempty"`
+}
+
+type signalRServerInv struct {
+	H string            `json:"H"`
+	M string            `json:"M"`
+	A []json.RawMessage `json:"A"`
+}
+
+type signalRClientInv struct {
+	H string `json:"H"`
+	M string `json:"M"`
+	A []any  `json:"A"`
+	I int    `json:"I"`
+}
+
+func (c *client) RequestLoginPush(ctx context.Context, ticket, username string) (*LoginPushResult, error) {
+	token, err := c.signalRNegotiate(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("signalr negotiate: %w", err)
+	}
+
+	listenCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ready := make(chan struct{})
+	messages := make(chan signalREnvelope, 32)
+	streamErr := make(chan error, 1)
+
+	go c.signalRListen(listenCtx, token, ready, messages, streamErr)
+
+	select {
+	case <-ready:
+	case err := <-streamErr:
+		return nil, fmt.Errorf("signalr connect: %w", err)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	if err := c.signalRStart(ctx, token); err != nil {
+		return nil, fmt.Errorf("signalr start: %w", err)
+	}
+
+	if err := c.signalRSend(ctx, token, ticket, username); err != nil {
+		return nil, fmt.Errorf("signalr send: %w", err)
+	}
+
+	for {
+		select {
+		case env := <-messages:
+			if env.E != "" {
+				return nil, fmt.Errorf("signalr hub error: %s", env.E)
+			}
+			for _, inv := range env.M {
+				if !strings.EqualFold(inv.M, "LoginUPRequestApproved") {
+					c.logger.Debug("signalr server invocation (ignored)",
+						"hub", inv.H, "method", inv.M)
+					continue
+				}
+				if len(inv.A) == 0 {
+					return nil, fmt.Errorf("LoginUPRequestApproved with no args")
+				}
+				var result LoginPushResult
+				if err := json.Unmarshal(inv.A[0], &result); err != nil {
+					return nil, fmt.Errorf("decode LoginUPRequestApproved: %w", err)
+				}
+				if !strings.EqualFold(result.Status, "APPROVED") {
+					return &result, fmt.Errorf("login push %s", result.Status)
+				}
+				return &result, nil
+			}
+		case err := <-streamErr:
+			return nil, fmt.Errorf("signalr stream: %w", err)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (c *client) LoginUPPush(firstStepTicket, pushRequestContent string, sessionID int) error {
+	request := struct {
+		FirstStepTicket    string `json:"firstStepTicket"`
+		PushRequestContent string `json:"pushRequestContent"`
+		SessionID          int    `json:"sessionID"`
+	}{
+		FirstStepTicket:    firstStepTicket,
+		PushRequestContent: pushRequestContent,
+		SessionID:          sessionID,
+	}
+
+	buf := new(bytes.Buffer)
+	_ = json.NewEncoder(buf).Encode(request)
+
+	req, _ := http.NewRequest(
+		http.MethodPost,
+		"https://rol.raiffeisenbank.rs/Retail/Protected/Services/RetailLoginService.svc/LoginUPPush",
+		buf,
+	)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("unexpected LoginUPPush status %d: %s", resp.StatusCode, string(body))
+	}
+
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *client) signalRNegotiate(ctx context.Context) (string, error) {
+	u := signalRBaseURL + "/negotiate?clientProtocol=" + signalRProtocol +
+		"&connectionData=" + url.QueryEscape(ibankingHubData) +
+		fmt.Sprintf("&_=%d", time.Now().UnixMilli())
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", referer)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var n signalRNegotiate
+	if err := json.NewDecoder(resp.Body).Decode(&n); err != nil {
+		return "", err
+	}
+	if n.ConnectionToken == "" {
+		return "", fmt.Errorf("empty connection token")
+	}
+	return n.ConnectionToken, nil
+}
+
+func (c *client) signalRListen(
+	ctx context.Context,
+	token string,
+	ready chan<- struct{},
+	messages chan<- signalREnvelope,
+	errCh chan<- error,
+) {
+	u := signalRBaseURL + "/connect?transport=serverSentEvents&clientProtocol=" + signalRProtocol +
+		"&connectionToken=" + url.QueryEscape(token) +
+		"&connectionData=" + url.QueryEscape(ibankingHubData) +
+		fmt.Sprintf("&tid=%d", time.Now().UnixNano()%10)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", referer)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		errCh <- err
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		errCh <- fmt.Errorf("connect status %d: %s", resp.StatusCode, string(body))
+		return
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var once sync.Once
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "initialized" {
+			once.Do(func() { close(ready) })
+			continue
+		}
+
+		var env signalREnvelope
+		if err := json.Unmarshal([]byte(payload), &env); err != nil {
+			c.logger.Warn("signalr: cannot parse message", "err", err, "raw", payload)
+			continue
+		}
+		if env.S == 1 {
+			once.Do(func() { close(ready) })
+		}
+		select {
+		case messages <- env:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
+		errCh <- err
+	}
+}
+
+func (c *client) signalRStart(ctx context.Context, token string) error {
+	u := signalRBaseURL + "/start?transport=serverSentEvents&clientProtocol=" + signalRProtocol +
+		"&connectionToken=" + url.QueryEscape(token) +
+		"&connectionData=" + url.QueryEscape(ibankingHubData) +
+		fmt.Sprintf("&_=%d", time.Now().UnixMilli())
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", referer)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func (c *client) signalRSend(ctx context.Context, token, ticket, username string) error {
+	data, _ := json.Marshal(signalRClientInv{
+		H: "ibankinghub",
+		M: "CreateLoginPushRequest",
+		A: []any{ticket, username},
+		I: 0,
+	})
+
+	form := url.Values{}
+	form.Set("data", string(data))
+
+	u := signalRBaseURL + "/send?transport=serverSentEvents&clientProtocol=" + signalRProtocol +
+		"&connectionToken=" + url.QueryEscape(token) +
+		"&connectionData=" + url.QueryEscape(ibankingHubData)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", referer)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return err
+	}
 	return nil
 }
 
