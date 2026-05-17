@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -35,8 +36,25 @@ func main() {
 		panic(err)
 	}
 
-	if err := c.LoginFont(username, password); err != nil {
+	loginResp, err := c.LoginFont(username, password)
+	if err != nil {
 		panic(err)
+	}
+
+	if loginResp.ForceSecondLogin {
+		fmt.Println("2FA required — approve the push notification on your phone...")
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		pushResult, err := c.RequestLoginPush(ctx, loginResp.Ticket, username)
+		cancel()
+		if err != nil {
+			fmt.Println("2FA push failed")
+			panic(err)
+		}
+		fmt.Printf("Push %s.\n", pushResult.Status)
+		if err := c.LoginUPPush(loginResp.Ticket, pushResult.PushRequestContent, loginResp.GeneratedSessionID); err != nil {
+			fmt.Println("can't finish 2FA login")
+			panic(err)
+		}
 	}
 
 	accountBalances, err := c.AllAccountBalance()

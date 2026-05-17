@@ -6,6 +6,24 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+type LoginPushResult struct {
+	Status             string `json:"Status"`
+	RequestId          string `json:"RequestId"`
+	FirstStepTicket    string `json:"FirstStepTicket"`
+	PushRequestContent string `json:"PushRequestContent"`
+}
+
+type LoginFontResponse struct {
+	Ticket                       string   `json:"Ticket"`
+	RequestToken                 string   `json:"RequestToken"`
+	ForceSecondLogin             bool     `json:"ForceSecondLogin"`
+	AdditionalAuthenticationType []string `json:"AdditionalAuthenticationType"`
+	SecurityUserID               int      `json:"SecurityUserID"`
+	GeneratedSessionID           int      `json:"GeneratedSessionID"`
+	FailedAttempts               int      `json:"FailedAttempts"`
+	TempBlockPeriodInMinutes     int      `json:"TempBlockPeriodInMinutes"`
+}
+
 type TransactionalAccountTurnoverRequest struct {
 	AccountNumber string                              `json:"accountNumber"`
 	FilterParam   *TransactionalAccountTurnoverFilter `json:"filterParam"`
